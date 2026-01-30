@@ -20,6 +20,7 @@
 - 依赖库：`requests`, `tqdm`
 
 安装依赖：
+
 ```bash
 pip install requests tqdm
 ```
@@ -56,19 +57,21 @@ SuggestionWorker
 ├── get_suggestions: 获取单个关键词的建议
 ├── save_suggestion: 保存建议词到文件
 ├── worker: 工作线程函数
+├── cleanup: 清理资源(进度条、队列等)
 └── run: 启动爬虫
 ```
 
 ### 数据结构
 
-| 数据 | 类型 | 说明 |
-|------|------|------|
-| `queue` | `Queue[Tuple[str, int]]` | 待处理队列，存储 (关键词, 深度) |
-| `results` | `Set[str]` | 已收集的建议词集合 |
-| `processed_queries` | `Set[str]` | 已处理的查询词集合 |
-| `lock` | `Lock` | 线程锁，保护共享数据 |
-| `max_depth` | `int` | 最大搜索深度 |
-| `pbar` | `tqdm` | 进度条对象（可选） |
+| 数据                | 类型                     | 说明                           |
+| ------------------- | ------------------------ | ------------------------------ |
+| `queue`             | `Queue[Tuple[str, int]]` | 待处理队列,存储 (关键词, 深度) |
+| `results`           | `Set[str]`               | 已收集的建议词集合             |
+| `processed_queries` | `Set[str]`               | 已处理的查询词集合             |
+| `lock`              | `Lock`                   | 线程锁,保护共享数据            |
+| `max_depth`         | `int`                    | 最大搜索深度                   |
+| `pbar`              | `tqdm`                   | 进度条对象(可选)               |
+| `shutdown_flag`     | `bool`                   | 优雅退出标志,用于控制线程退出  |
 
 ### 工作流程
 
@@ -111,19 +114,19 @@ depth=0: ai
 
 ## API 详解
 
-### SuggestionWorker.__init__
+### SuggestionWorker.**init**
 
 ```python
 def __init__(self, main_keyword: str, output_dir: str = "results",
              num_workers: int = 2, max_depth: int = 5):
 ```
 
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|--------|------|
-| `main_keyword` | `str` | - | 主要关键词，结果必须包含此词 |
-| `output_dir` | `str` | `"results"` | 输出目录 |
-| `num_workers` | `int` | `2` | 并发工作线程数 |
-| `max_depth` | `int` | `5` | 最大搜索深度 |
+| 参数           | 类型  | 默认值      | 说明                         |
+| -------------- | ----- | ----------- | ---------------------------- |
+| `main_keyword` | `str` | -           | 主要关键词，结果必须包含此词 |
+| `output_dir`   | `str` | `"results"` | 输出目录                     |
+| `num_workers`  | `int` | `2`         | 并发工作线程数               |
+| `max_depth`    | `int` | `5`         | 最大搜索深度                 |
 
 ### SuggestionWorker.get_suggestions
 
@@ -134,17 +137,21 @@ def get_suggestions(self, query: str) -> List[str]:
 调用 Google Suggest API 获取指定查询的建议词列表。
 
 **请求参数**：
+
 - `query`: 查询词
 
 **返回值**：
+
 - `List[str]`: 包含主关键词的建议词列表
 
 **API 端点**：
+
 ```
 https://suggestqueries.google.com/complete/search?output=toolbar&hl=en&q={query}
 ```
 
 **请求头**：
+
 ```python
 {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -153,27 +160,44 @@ https://suggestqueries.google.com/complete/search?output=toolbar&hl=en&q={query}
 
 ### SuggestionWorker.worker
 
-工作线程主函数，处理队列中的任务。
+工作线程主函数,处理队列中的任务。
 
-**处理逻辑**：
-1. 从队列获取 `(query, depth)`，超时 60 秒
-2. 检查是否已处理，若已处理则跳过
-3. 检查深度限制，超过 max_depth 则跳过
-4. 调用 `get_suggestions` 获取建议
-5. 线程安全地保存新建议并入队
-6. 休眠 1 秒避免请求过快
+**处理逻辑**:
+
+1. 循环检查 `shutdown_flag`,支持优雅退出
+2. 从队列获取 `(query, depth)`,超时 60 秒
+3. 检查是否已处理,若已处理则跳过
+4. 检查深度限制,超过 max_depth 则跳过
+5. 调用 `get_suggestions` 获取建议
+6. 线程安全地保存新建议并入队
+7. 休眠 1 秒避免请求过快
+8. 在异常处理中检查 `shutdown_flag`,确保能及时退出
+
+### SuggestionWorker.cleanup
+
+清理资源的方法,在程序退出时调用。
+
+**清理步骤**:
+
+1. 安全关闭 tqdm 进度条(使用 `is not None` 检查)
+2. 设置 `shutdown_flag = True` 通知所有线程退出
+3. 清空队列中的所有待处理任务
+4. 向所有工作线程发送停止信号 `(None, 0)`
 
 ### SuggestionWorker.run
 
 启动爬虫的主入口。
 
-**执行步骤**：
+**执行步骤**:
+
 1. 创建/清空输出文件
 2. 初始关键词入队
-3. 启动工作线程
-4. 等待队列处理完成
-5. 发送停止信号
-6. 打印统计结果
+3. 启动工作线程(设置为守护线程)
+4. 使用 `try-except-finally` 结构处理:
+   - **正常流程**: 等待队列处理完成,发送停止信号
+   - **中断处理**: 捕获 `KeyboardInterrupt`,调用 `cleanup()` 清理资源
+   - **最终清理**: 在 `finally` 块中确保进度条被关闭
+5. 打印统计结果
 
 ## 线程安全设计
 
@@ -195,6 +219,43 @@ with self.lock:
 - 使用 `queue.get(timeout=60)` 避免无限阻塞
 - 使用 `queue.task_done()` 标记任务完成
 - 使用 `queue.join()` 等待所有任务完成
+
+### 优雅退出机制
+
+脚本使用 `KeyboardInterrupt` 异常处理机制实现优雅退出,而不是信号处理器:
+
+```python
+try:
+    self.queue.join()
+    time.sleep(2)
+
+    # 正常结束,发送停止信号
+    for _ in range(self.num_workers):
+        self.queue.put((None, 0))
+    for t in threads:
+        t.join(timeout=5)
+
+except KeyboardInterrupt:
+    print("\n收到中断信号,正在清理资源...")
+    self.cleanup()
+    # 等待线程退出
+    for t in threads:
+        t.join(timeout=2)
+finally:
+    # 确保进度条被关闭
+    if self.pbar is not None:
+        try:
+            self.pbar.close()
+        except:
+            pass
+```
+
+**优势**:
+
+- ✅ 正确清理所有资源(进度条、队列、线程)
+- ✅ 不会产生资源泄漏警告
+- ✅ 使用守护线程(`daemon=True`)确保主进程退出时线程自动终止
+- ✅ 使用 `is not None` 检查 tqdm 对象,避免 `TypeError`
 
 ## 错误处理
 
@@ -221,27 +282,6 @@ except Empty:
     if self.queue.empty():
         break
     continue
-```
-
-### 信号处理
-
-```python
-def signal_handler(signum, frame):
-    print("\n收到中断信号，正在退出...")
-    sys.exit(0)
-
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
-```
-
-**注意**：信号处理只会退出主线程，工作线程会随着程序退出而终止。如需更优雅的退出，可在 `signal_handler` 中添加进度条关闭逻辑：
-
-```python
-def signal_handler(signum, frame):
-    print("\n收到中断信号，正在退出...")
-    if hasattr(crawler, 'pbar') and crawler.pbar:
-        crawler.pbar.close()
-    sys.exit(0)
 ```
 
 ## 输出格式
@@ -273,10 +313,10 @@ time.sleep(1)
 通过 `max_depth` 控制搜索范围，平衡覆盖度和效率：
 
 | max_depth | 预计结果数 | 耗时 |
-|-----------|-----------|------|
-| 3 | ~数百 | 短 |
-| 5 | ~数千 | 中 |
-| 10 | ~数万 | 长 |
+| --------- | ---------- | ---- |
+| 3         | ~数百      | 短   |
+| 5         | ~数千      | 中   |
+| 10        | ~数万      | 长   |
 
 ### 并发数
 
@@ -328,6 +368,7 @@ filtered_suggestions = [
 脚本使用 `tqdm` 库实时显示采集进度：
 
 **初始化进度条**（在 `run()` 中）：
+
 ```python
 if HAS_TQDM:
     self.pbar = tqdm(desc="收集进度", unit="词")
@@ -335,33 +376,44 @@ else:
     print("提示: 安装 tqdm 可显示进度条 (pip install tqdm)")
 ```
 
-**更新进度条**（在 `save_suggestion()` 中）：
+**更新进度条**(在 `save_suggestion()` 中):
+
 ```python
 def save_suggestion(self, suggestion: str):
     with open(self.output_file, 'a', encoding='utf-8') as f:
         f.write(f"{suggestion}\n")
     # 更新进度条
-    if self.pbar:
+    if self.pbar is not None:
         self.pbar.update(1)
 ```
 
-**关闭进度条**（在 `run()` 结束时）：
+**关闭进度条**(在 `run()` 结束时和 `cleanup()` 中):
+
 ```python
-if self.pbar:
-    self.pbar.close()
+# 使用 is not None 检查,避免 tqdm 的 __bool__ 抛出 TypeError
+if self.pbar is not None:
+    try:
+        self.pbar.close()
+    except:
+        pass
 ```
 
+> **重要提示**: tqdm 进度条在某些状态下(如 `iterable == total == None`)直接使用 `if self.pbar:` 会抛出 `TypeError: bool() undefined when iterable == total == None`。因此必须使用 `if self.pbar is not None:` 来检查。
+
 **效果展示**：
+
 ```
 收集进度: 100%|████████████████| 1234词 [00:30<02:00, 41.2词/秒]
 ```
 
 ## 注意事项
 
-1. **合规使用**：请遵守 Google 的服务条款，避免过度请求
-2. **频率控制**：适当设置请求间隔，防止 IP 被封禁
-3. **深度选择**：根据实际需求选择合适的 max_depth
-4. **结果去重**：自动去重，但多次运行可能产生重复文件
+1. **合规使用**:请遵守 Google 的服务条款,避免过度请求
+2. **频率控制**:适当设置请求间隔,防止 IP 被封禁
+3. **深度选择**:根据实际需求选择合适的 max_depth
+4. **结果去重**:自动去重,但多次运行可能产生重复文件
+5. **优雅退出**:按 Ctrl+C 可安全退出,程序会自动清理资源,不会产生警告
+6. **tqdm 检查**:在代码中检查 tqdm 对象时必须使用 `is not None`,不能直接用布尔检查
 
 ## 许可证
 

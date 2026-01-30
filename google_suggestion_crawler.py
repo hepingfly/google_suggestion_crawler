@@ -35,7 +35,7 @@ class SuggestionWorker:
         初始化搜索建议爬虫
 
         Args:
-            main_keyword: 主要关键词，必须包含在结果中
+            main_keyword: 主要关键词,必须包含在结果中
             output_dir: 输出目录
             num_workers: 并发工作线程数
             max_depth: 最大搜索深度
@@ -62,6 +62,9 @@ class SuggestionWorker:
 
         # 进度条
         self.pbar = None
+        
+        # 优雅退出标志
+        self.shutdown_flag = False
 
     def get_suggestions(self, query: str) -> List[str]:
         """获取 Google 搜索建议"""
@@ -102,7 +105,7 @@ class SuggestionWorker:
 
     def worker(self):
         """工作线程函数"""
-        while True:
+        while not self.shutdown_flag:
             try:
                 query, depth = self.queue.get(timeout=self.QUEUE_TIMEOUT)
 
@@ -134,10 +137,38 @@ class SuggestionWorker:
                 self.queue.task_done()
 
             except Empty:
-                if self.queue.empty():
+                if self.queue.empty() or self.shutdown_flag:
                     break
             except Exception as e:
                 print(f"处理时出错: {type(e).__name__}: {e}")
+                self.queue.task_done()
+
+    def cleanup(self):
+        """清理资源"""
+        # 关闭进度条
+        if self.pbar is not None:
+            try:
+                self.pbar.close()
+            except:
+                pass
+        
+        # 设置退出标志
+        self.shutdown_flag = True
+        
+        # 清空队列并发送停止信号
+        while not self.queue.empty():
+            try:
+                self.queue.get_nowait()
+                self.queue.task_done()
+            except Empty:
+                break
+        
+        # 发送停止信号
+        for _ in range(self.num_workers):
+            try:
+                self.queue.put((None, 0), block=False)
+            except:
+                pass
 
     def run(self):
         """运行爬虫"""
@@ -171,36 +202,39 @@ class SuggestionWorker:
         threads = []
         for _ in range(self.num_workers):
             t = Thread(target=self.worker)
+            t.daemon = True  # 设置为守护线程
             t.start()
             threads.append(t)
 
-        self.queue.join()
-        time.sleep(2)
+        try:
+            self.queue.join()
+            time.sleep(2)
 
-        for _ in range(self.num_workers):
-            self.queue.put((None, 0))
-        for t in threads:
-            t.join(timeout=5)
+            # 正常结束,发送停止信号
+            for _ in range(self.num_workers):
+                self.queue.put((None, 0))
+            for t in threads:
+                t.join(timeout=5)
 
-        # 关闭进度条
-        if self.pbar:
-            self.pbar.close()
+        except KeyboardInterrupt:
+            print("\n收到中断信号,正在清理资源...")
+            self.cleanup()
+            # 等待线程退出
+            for t in threads:
+                t.join(timeout=2)
+        finally:
+            # 确保进度条被关闭
+            if self.pbar is not None:
+                try:
+                    self.pbar.close()
+                except:
+                    pass
 
         print(f"\n已完成! 共收集到 {len(self.results)} 个建议关键词")
         print(f"结果已保存到: {self.output_file}")
 
 
-def signal_handler(signum, frame):
-    """信号处理函数，支持优雅退出"""
-    print("\n收到中断信号，正在退出...")
-    os._exit(0)
-
-
 def main():
-    # 设置信号处理
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
     main_keyword = input("请输入主要关键词: ").strip()
 
     crawler = SuggestionWorker(
